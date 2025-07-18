@@ -6,3 +6,4 @@ httpx
 pydantic
 langchain_openai
 langchain_community
+dashscope
