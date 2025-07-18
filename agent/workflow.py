@@ -1,68 +1,120 @@
-# -*- coding: utf-8 -*-
-from langgraph.graph import StateGraph
-from .intent import detect_intent
-from .rag import rag_search
-from .tools import tool_router
-from .memory import get_user_memory
-from .llm import get_llm
+from pydantic import BaseModel
+from pydantic import Field
+from typing_extensions import Literal
+from langchain_core.messages import HumanMessage, SystemMessage
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from IPython.display import Image, display
+from langchain_anthropic import ChatAnthropic
 
-# 预留意图类型
-INTENTS = ["qa", "search", "homework", "tool_call", "other"]
+import getpass
+import os
 
-def router_node(input_data):
-    """
-    Router节点，先关键字识别意图，失败后用LLM识别。
-    """
-    intent = detect_intent(input_data["message"])
-    return {"intent": intent, **input_data}
+from langchain_community.chat_models.tongyi import ChatTongyi
+llm = ChatTongyi(
+    model="qwen-max",
+    api_key="sk-2ccd6eee4dc04773add239ab18db4a8f",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
 
-# 各意图节点预留
 
-def qa_node(input_data):
-    # 答疑意图，走RAG
-    return rag_search(input_data)
+# Schema for structured output to use as routing logic
+class Route(BaseModel):
+    step: Literal["poem", "story", "joke"] = Field(
+        None, description="The next step in the routing process"
+    )
 
-def search_node(input_data):
-    # 查资料意图，走RAG
-    return rag_search(input_data)
 
-def homework_node(input_data):
-    # 作业批改意图，预留
-    return {"result": "作业批改功能开发中...", **input_data}
+# Augment the LLM with schema for structured output
+router = llm.with_structured_output(Route)
 
-def tool_call_node(input_data):
-    # 工具调用意图
-    return tool_router(input_data)
 
-def other_node(input_data):
-    # 兜底意图
-    return {"result": "暂未识别到你的意图，请详细描述。", **input_data}
+# State
+class State(TypedDict):
+    input: str
+    decision: str
+    output: str
 
-# workflow定义
-def build_agent_workflow():
-    sg = StateGraph()
-    sg.add_node("router", router_node)
-    sg.add_node("qa", qa_node)
-    sg.add_node("search", search_node)
-    sg.add_node("homework", homework_node)
-    sg.add_node("tool_call", tool_call_node)
-    sg.add_node("other", other_node)
-    # router根据intent路由
-    sg.add_edge("router", lambda x: x["intent"])
-    sg.add_edge("qa", "end")
-    sg.add_edge("search", "end")
-    sg.add_edge("homework", "end")
-    sg.add_edge("tool_call", "end")
-    sg.add_edge("other", "end")
-    return sg
 
-def run_agent_workflow(user_id, message):
-    # 获取用户memory
-    memory = get_user_memory(user_id)
-    # 获取llm
-    llm = get_llm()
-    # 构造输入
-    input_data = {"user_id": user_id, "message": message, "memory": memory, "llm": llm}
-    workflow = build_agent_workflow()
-    result = workflow.run(input_data)
-    return result 
+# Nodes
+def llm_call_1(state: State):
+    """Write a story"""
+
+    result = llm.invoke(state["input"])
+    return {"output": result.content}
+
+
+def llm_call_2(state: State):
+    """Write a joke"""
+
+    result = llm.invoke(state["input"])
+    return {"output": result.content}
+
+
+def llm_call_3(state: State):
+    """Write a poem"""
+
+    result = llm.invoke(state["input"])
+    return {"output": result.content}
+
+
+def llm_call_router(state: State):
+    """Route the input to the appropriate node"""
+
+    # Run the augmented LLM with structured output to serve as routing logic
+    decision = router.invoke(
+        [
+            SystemMessage(
+                content="Route the input to story, joke, or poem based on the user's request."
+            ),
+            HumanMessage(content=state["input"]),
+        ]
+    )
+
+    return {"decision": decision.step}
+
+
+# Conditional edge function to route to the appropriate node
+def route_decision(state: State):
+    # Return the node name you want to visit next
+    if state["decision"] == "story":
+        return "llm_call_1"
+    elif state["decision"] == "joke":
+        return "llm_call_2"
+    elif state["decision"] == "poem":
+        return "llm_call_3"
+
+
+# Build workflow
+router_builder = StateGraph(State)
+
+# Add nodes
+router_builder.add_node("llm_call_1", llm_call_1)
+router_builder.add_node("llm_call_2", llm_call_2)
+router_builder.add_node("llm_call_3", llm_call_3)
+router_builder.add_node("llm_call_router", llm_call_router)
+
+# Add edges to connect nodes
+router_builder.add_edge(START, "llm_call_router")
+router_builder.add_conditional_edges(
+    "llm_call_router",
+    route_decision,
+    {  # Name returned by route_decision : Name of next node to visit
+        "llm_call_1": "llm_call_1",
+        "llm_call_2": "llm_call_2",
+        "llm_call_3": "llm_call_3",
+    },
+)
+router_builder.add_edge("llm_call_1", END)
+router_builder.add_edge("llm_call_2", END)
+router_builder.add_edge("llm_call_3", END)
+
+# Compile workflow
+router_workflow = router_builder.compile()
+
+# Show the workflow
+display(Image(router_workflow.get_graph().draw_mermaid_png()))
+
+# Invoke
+state = router_workflow.invoke({"input": "Write me a joke about cats"})
+print(state["output"])
