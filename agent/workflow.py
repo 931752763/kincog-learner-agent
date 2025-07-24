@@ -1,22 +1,13 @@
+# -*- coding: utf-8 -*-
 from pydantic import BaseModel
 from pydantic import Field
 from typing_extensions import Literal
 from langchain_core.messages import HumanMessage, SystemMessage
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
-from IPython.display import Image, display
-from langchain_anthropic import ChatAnthropic
 
-import getpass
-import os
-
-from langchain_community.chat_models.tongyi import ChatTongyi
-llm = ChatTongyi(
-    model="qwen-max",
-    api_key="sk-2ccd6eee4dc04773add239ab18db4a8f",
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-
+from agent.llm import llm
+from agent.rag import vectorstore
 
 # Schema for structured output to use as routing logic
 class Route(BaseModel):
@@ -24,10 +15,8 @@ class Route(BaseModel):
         None, description="The next step in the routing process"
     )
 
-
 # Augment the LLM with schema for structured output
 router = llm.with_structured_output(Route)
-
 
 # State
 class State(TypedDict):
@@ -35,44 +24,50 @@ class State(TypedDict):
     decision: str
     output: str
 
-
 # Nodes
 def llm_call_1(state: State):
-    """Write a story"""
-
-    result = llm.invoke(state["input"])
+    """Write a story with RAG capability"""
+    # Retrieve relevant documents
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    docs = retriever.invoke(state["input"])
+    
+    # Format retrieved context
+    context = "\n".join([doc.page_content for doc in docs])
+    
+    # Create prompt with context
+    prompt = f"基于以下背景知识回答问题：\n\n{context}\n\n问题：{state['input']}\n\n回答："
+    
+    # Generate response
+    result = llm.invoke(prompt)
     return {"output": result.content}
-
 
 def llm_call_2(state: State):
     """Write a joke"""
-
     result = llm.invoke(state["input"])
     return {"output": result.content}
-
 
 def llm_call_3(state: State):
     """Write a poem"""
-
     result = llm.invoke(state["input"])
     return {"output": result.content}
 
-
 def llm_call_router(state: State):
     """Route the input to the appropriate node"""
-
     # Run the augmented LLM with structured output to serve as routing logic
     decision = router.invoke(
         [
             SystemMessage(
-                content="Route the input to story, joke, or poem based on the user's request."
+                content="Route the input to story, joke, or poem based on the user's request. If the input is a question about machine learning, deep learning, NLP, or Python, route to story."
             ),
             HumanMessage(content=state["input"]),
         ]
     )
 
-    return {"decision": decision.step}
+    # Handle case where decision is None
+    if decision is None or decision.step is None:
+        return {"decision": "story"}  # Default to story if routing fails
 
+    return {"decision": decision.step}
 
 # Conditional edge function to route to the appropriate node
 def route_decision(state: State):
@@ -83,7 +78,6 @@ def route_decision(state: State):
         return "llm_call_2"
     elif state["decision"] == "poem":
         return "llm_call_3"
-
 
 # Build workflow
 router_builder = StateGraph(State)
@@ -105,16 +99,10 @@ router_builder.add_conditional_edges(
         "llm_call_3": "llm_call_3",
     },
 )
+
 router_builder.add_edge("llm_call_1", END)
 router_builder.add_edge("llm_call_2", END)
 router_builder.add_edge("llm_call_3", END)
 
 # Compile workflow
 router_workflow = router_builder.compile()
-
-# Show the workflow
-display(Image(router_workflow.get_graph().draw_mermaid_png()))
-
-# Invoke
-state = router_workflow.invoke({"input": "Write me a joke about cats"})
-print(state["output"])
